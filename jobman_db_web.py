@@ -23,12 +23,15 @@ import urlparse
 import jinja2
 import psycopg2
 import jobman.sql
+import jobman.tools
 import datetime
 import sys
 import urllib
-import json
+#import json
+import sqlalchemy
 
 server = {} # Filled in from command line
+db_url = "" # Filled in from command line
 
 def jobman_status_string( i ):
     d = {jobman.sql.START: 'QUEUED', jobman.sql.RUNNING: 'RUNNING',
@@ -39,8 +42,6 @@ def jobman_status_string( i ):
         return d[i]
     else:
         return str(i)
-
-
 
 # From https://github.com/liudmil-mitev/experiments/blob/master/time/humanize_time.py
 INTERVALS = [1, 60, 3600, 86400, 604800, 2419200, 29030400]
@@ -181,25 +182,93 @@ class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
             return
         yaml = rows[0][0]
         self.wfile.write(yaml)
+            
+    #~ def get_cursor( self ):
+        #~ if not hasattr(self, 'conn' ):
+            #~ try:
+                #~ self.conn = psycopg2.connect("dbname='" + server['dbname'] +
+                                        #~ "' user='" + server['user'] +
+                                        #~ "' host='" + server['host'] + 
+                                        #~ "' password='"+ server['password'] + "'")
+            #~ except:
+                #~ self.send_python_error()
+                #~ raise Exception("Could not connect to database")
+        #~ if not hasattr( self, 'cursor' ):
+            #~ self.cursor = self.conn.cursor()
+        #~ return self.cursor
+    
+    def get_session( self ):
+        global db_url
+        if not hasattr(self, 'db' ):
+            self.db = None
+        if self.db==None:
+            self.db = jobman.api0.open_db(db_url, serial=True)        
+        if not hasattr(self, 'session' ):
+            self.session = None
+        if self.session==None:
+            self.session = self.db.session()
+        return self.session
+    
+    def get_dcts( self ):
+        if not hasattr(self, 'dcts' ):
+            s = self.get_session()
+            q = s.query(self.db._Dict)
+            q = q.options(sqlalchemy.orm.eagerload('_attrs')) #hard-coded in api0        
+            self.dcts = q.all()
+        return self.dcts
+    
+    def commit(self):
+        self.session.commit()
+
+    experiment_graph_template = """
+                        <html>
+                        <body>                         
+                        <form action="/experiment_graph" method="GET">
+                            <input type="hidden" name="id" value="{{ id }}" /> 
+                            {% for checkbox in checkboxes %}
+                                {% if checkbox in keys %}
+                                    <input type="checkbox" name="key" value="{{ checkbox }}" checked>{{ checkbox }}<br>
+                                {% else %}
+                                    <input type="checkbox" name="key" value="{{ checkbox }}">{{ checkbox }}<br>
+                                {% endif %}
+                            {% endfor %}
+                            <input type="submit"> 
+                        </form>
+                        <img src="/render_graph?id={{ id }}{% for key in keys %}&key={{ key }}{% endfor %}\"/>
+                        </body>
+                        </html>"""
+
+        
+    def do_experiment_graph( self, args ):
+        id = int(args['id'][0])
+        keys = args['key']
+        dcts = self.get_dcts()
+        checkboxes = []
+        for dct in dcts:
+            if dct.id==id:
+                for key, val in dct.items():
+                    if isinstance(val,list):
+                        if isinstance(val[0], float) or isinstance(val[0], int):
+                            checkboxes.append( key )
+
+        
+        env = jinja2.Environment( loader=jinja2.DictLoader( {'output':  self.experiment_graph_template } ) )
+        self.wfile.write( env.get_template('output').render(checkboxes = checkboxes, id=id, keys=keys ) )
+                                    
         
     
-    def get_cursor( self ):
-        if not hasattr(self, 'conn' ):
-            try:
-                self.conn = psycopg2.connect("dbname='" + server['dbname'] +
-                                        "' user='" + server['user'] +
-                                        "' host='" + server['host'] + 
-                                        "' password='"+ server['password'] + "'")
-            except:
-                self.send_python_error()
-                raise Exception("Could not connect to database")
-        if not hasattr( self, 'cursor' ):
-            self.cursor = self.conn.cursor()
-        return self.cursor
-    
     def do_render_graph( self, args ):
-        eid = int(args['experimentid'][0])
-        colname = args['colname'][0]
+        id = map( lambda x: int(x), args['id'] )        
+        keys = args['key']
+        print args
+        if 'thumb' in args:
+            if args['thumb'][0]=='True':
+                thumb = True
+            else:
+                thumb = False
+        else:
+            thumb = False
+            
         if 'from_epoch' in args.keys():
             from_epoch = int(args['from_epoch'][0])
         else:
@@ -207,36 +276,162 @@ class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
         #graph_spec = args['graph_spec'][0]
         #graph_spec=urllib.unquote_plus( graph_spec ) 
         
-        cur = self.get_cursor()
-        cur.execute( "select results_%s from %s where id=%d;"%(colname, server['view'], eid) )
-        rows = cur.fetchall()
-        if len(rows)>0:
-            graph_spec = rows[0][0]
-            graph_spec = json.loads( graph_spec )
-            assert graph_spec[0]=='graph'
-            yaxis = graph_spec[1]
-            xaxis = graph_spec[2]
-            curves = graph_spec[3]
-            
-            plt.figure()
-            plt.xlabel( xaxis )
-            plt.ylabel( yaxis )
-            for label,curve in curves.items():
-                plt.plot( range(from_epoch, len(curve)), curve[from_epoch:], label=label )
-            plt.legend()
-                
-            #buf = io.BytesIO()
-            plt.savefig(self.wfile, format = 'png')
-            #buf.seek(0)
-            #buf.close()
+        #cur = self.get_cursor()        
+        #cur.execute( "select results_%s from %s where id=%d;"%(colname, server['view'], eid) )
+        #rows = cur.fetchall()
+        dcts = self.get_dcts()
+        for dct in dcts:
+            if dct.id in id:
+                #if graph_spec[0]=='graph':
+                #    yaxis = graph_spec[1]
+                #    xaxis = graph_spec[2]
+                #    curves = graph_spec[3]
+                #else:
+                #    xaxis = 'bla'
+                #    yaxis = 'bla'
+                #    curves = {'bla': graph_spec}
+                curves = {}
+                for key in keys:
+                    curves["id " + key] = dct[key]
+        
+        plt.figure()
+        #plt.xlabel( xaxis )
+        #plt.ylabel( yaxis )
+        for label,curve in curves.items():
+            plt.plot( curve, label=label )
+        plt.ylim( [from_epoch, max( map( lambda x: len(x), curves.values() ) )] )
+        plt.legend()
+        if thumb:
+            plt.savefig(self.wfile, format = 'png', dpi=(25))
+        else:
+            plt.savefig(self.wfile, format = 'png' )
     
+    monitor_template = """
+                   <html>
+                     <body>
+                       <link rel="stylesheet" type="text/css" href="//cdn.datatables.net/1.10.0-beta.1/css/jquery.dataTables.css">
+                       <script type="text/javascript" language="javascript" src="http://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script>
+                       <script type="text/javascript" language="javascript" src="http://cdn.datatables.net/1.10.0/js/jquery.dataTables.js"></script>
+                       <LINK href="http://cdn.datatables.net/1.10.0/css/jquery.dataTables.css" rel="stylesheet" type="text/css">
+                       <script type="text/javascript" language="javascript" src="http://cdn.datatables.net/colreorder/1.1.1/js/dataTables.colReorder.min.js"></script>
+                       <LINK href="http://cdn.datatables.net/colreorder/1.1.1/css/dataTables.colReorder.css" rel="stylesheet" type="text/css">
+                       <script type="text/javascript" language="javascript" src="http://cdn.datatables.net/colvis/1.1.0/js/dataTables.colVis.min.js"></script>
+                       <LINK href="http:////cdn.datatables.net/colvis/1.1.0/css/dataTables.colVis.css" rel="stylesheet"  type="text/css"> <!-- -->
+                       <script>
+                          $(document).ready(function() {
+                             $('#example').dataTable( {
+                                   /*dom: 'pRC',*/
+                                   stateSave: true
+                            });
+                          } );
+                       </script>
+
+                       <center><h1>DB: {{ db_url }}</h1></center>
+                       Missing information in the table? Try running jobman sqlview (see below)<br>
+                       <table id="example" class="display" width="100%">
+                          <thead>
+                              <!--<tr>
+                                  <td colspan=2><center><b>Control</b></center></td>
+                                  <td colspan=9><center><b>Jobman data</b></center></td>
+                                  <td colspan={{ hyperparam_columns|length }}><center><b>Hyperparams</b></center></td>
+                                  <td colspan={{ result_columns|length }}><center><b>Results</b></center></td>
+                              </tr>-->
+                              <tr>
+                                  <td><b>Ctl</b></td>
+                                  <td><b>ID</b></td>
+                                  {% for col in cols %}
+                                     <td><b>{{ col }}</b></td>
+                                  {% endfor %}
+                              </tr>
+                          </thead>
+                          <tbody>
+                              {% for row in rows %}
+                                 <tr>
+                                    <td><span title="x=delete o=reschedule"><a href="/delete_experiment?experimentid={{ row[0] }}">x</a>&nbsp;<a href="/reschedule_experiment?experimentid={{ row[0] }}">o</a></span></td>                                 
+                                    <td>{{ row[0] }}</td>
+                                    {% for col in cols %}
+                                        <td>{{ row[1][col] }}</td>
+                                    {% endfor %}
+                                 </tr>
+                              {% endfor %}
+                            </tbody>
+                        </table>
+                        <br>
+                        To schedule a job:<br>
+                        jobman -f sqlschedule {{ db_url }} experiment.train_experiment [conf file]<br>
+                        To run a job:<br>
+                        jobman sql {{ db_url }} .<br>
+                     </body>
+                    </html>"""
+    
+    def do_get_key_contents( self, args ):
+        self.send_response(200, 'OK')
+        self.send_header('Content-type', 'html')
+        self.end_headers()
+        
+        id = int(args['id'][0])
+        key = args['key'][0]
+        dcts = self.get_dcts()
+        for dct in dcts:
+            if dct.id==id:
+                self.wfile.write( dct[key] )
+    
+    def columns( self, dcts ):
+        cols = {}
+        for dct in dcts:
+            for k in dct.keys():
+                cols[k] = ''
+        ret = cols.keys()
+        ret.sort()
+        return ret
+
     def do_monitor(self, args):
+        global db_url
+        self.send_response(200, 'OK')
+        self.send_header('Content-type', 'html')
+        self.end_headers()    
+        
+        dcts = self.get_dcts()
+        cols = self.columns( dcts )
+        
+        print jobman.tools.expand( dcts[0] )
+        
+        rows = []
+        for dct in dcts:
+            rowcols = {}
+            for col in cols:
+                if col in dct.keys():
+                    #if isinstance(dct[col],list):
+                    s = str(dct[col])
+                    if len(s)>20:
+                        if len(s)>100:
+                            s = "<span title=\"%s\"><a href=\"get_key_contents?id=%d&key=%s\">%s...</a></span>"""%( s, dct.id, col, s[:20] )
+                        else:
+                            s = "<span title=\"%s\">%s...</span>"""%( s, s[:20] )
+                    rowcols[col] = s
+                else:
+                    rowcols[col] = None                    
+            rows.append( (dct.id, rowcols) )
+        
+        env = jinja2.Environment( loader=jinja2.DictLoader( {'output':  self.monitor_template } ) )
+        self.wfile.write( env.get_template('output').render(cols = cols, rows=rows) )
+        
+        #self.wfile.write( self.columns( dcts ) ) 
+
+        #for d in dcts:
+        #    self.wfile.write("A dict\n")            
+        #    self.wfile.write(str(dir(d)) + "\n")
+        #    self.wfile.write(str(d.id) + "\n")
+        #    for k in d.keys():
+        #        self.wfile.write(k + "\n")
+    
+    def do_monitor_(self, args):
         global server
         self.send_response(200, 'OK')
         self.send_header('Content-type', 'html')
         self.end_headers()
         
-        colstoget = ["id", "jobman_status", "jobman_sql_hostname", "jobman_sql_hostworkdir", "jobman_starttime", "jobman_endtime", "jobman_runtime", "jobman_lastupdatetime"]
+        colstoget = ["id", "jobman_status", "jobman_sql_hostname", "jobman_sql_hostworkdir", "jobman_starttime", "jobman_endtime", "jobman_runtime", "jobman_lastsavedtime"]
         colnames = self.get_column_names()
         
         result_columns = filter( lambda x: x.startswith("results_"), colnames )
@@ -278,109 +473,20 @@ class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
                     except:
                         rows[i][8][col] =  therest[j]
                     if isinstance( rows[i][8][col], list):
-                        if rows[i][8][col][0]=='graph':
+                        if rows[i][8][col][0]=='graph' or isinstance( rows[i][8][col][0], float ) or isinstance( rows[i][8][col][0], int ):
                             #imgurl = "/render_graph?graph_spec=%s"%(urllib.quote_plus( results[j] ))
                             imgurl = "/render_graph?experimentid=%d&colname=%s"%(rows[i][0],col)
                             scale = "10%"
                             rows[i][8][col] = "<a href=\"%s\"><img height=\"%s\" src=\"%s\"></a>"%(imgurl,scale,imgurl)
                         elif rows[i][8][col][0]=='sound':
                             rows[i][8][col] = 'sound'
+                        elif isinstance( rows[i][8][col][0], list ):
+                            rows[i][8][col] = "list of lists"
                 for j,col in enumerate(hyperparam_columns):
                     rows[i][9][col] = therest[len(result_columns) + j]
-
-        template = """
-                   <html>
-                     <body>
-                       <link rel="stylesheet" type="text/css" href="//cdn.datatables.net/1.10.0-beta.1/css/jquery.dataTables.css">
-                       <script type="text/javascript" language="javascript" src="http://ajax.googleapis.com/ajax/libs/jquery/1.10.2/jquery.min.js"></script>
-                       <script type="text/javascript" language="javascript" src="http://cdn.datatables.net/1.10.0/js/jquery.dataTables.js"></script>
-                       <LINK href="http://cdn.datatables.net/1.10.0/css/jquery.dataTables.css" rel="stylesheet" type="text/css">
-                       <script type="text/javascript" language="javascript" src="http://cdn.datatables.net/colreorder/1.1.1/js/dataTables.colReorder.min.js"></script>
-                       <LINK href="http://cdn.datatables.net/colreorder/1.1.1/css/dataTables.colReorder.css" rel="stylesheet" type="text/css">
-                       <script type="text/javascript" language="javascript" src="http://cdn.datatables.net/colvis/1.1.0/js/dataTables.colVis.min.js"></script>
-                       <LINK href="http:////cdn.datatables.net/colvis/1.1.0/css/dataTables.colVis.css" rel="stylesheet"  type="text/css"> <!-- -->
-                       <script>
-                          $(document).ready(function() {
-                             $('#example').dataTable( {
-                                   /*dom: 'pRC',*/
-                                   stateSave: true
-                            });
-                          } );
-                       </script>
-
-                       <center><h1>Table: {{ server['tablename'] }}</h1></center>
-                       Missing information in the table? Try running jobman sqlview (see below)<br>
-                       <table id="example" class="display" width="100%">
-                          <thead>
-                              <tr>
-                                  <td colspan=2><center><b>Control</b></center></td>
-                                  <td colspan=9><center><b>Jobman data</b></center></td>
-                                  <td colspan={{ hyperparam_columns|length }}><center><b>Hyperparams</b></center></td>
-                                  <td colspan={{ result_columns|length }}><center><b>Results</b></center></td>
-                              </tr>
-                              <tr>
-                                  <td><b>Del</b></td>
-                                  <td><b>Resched</b></td>
-                              
-                                  <td><b>ID</b></td>
-                                  <td><b>Status</b></td>
-                                  <td><b>Yaml<br>template</b></td>
-                                  <td><b>Execution<br>host</b></td>
-                                  <td><b>Host<br>work dir</b></td>
-                                  <td><b>Start<b>time</b></td>
-                                  <td><b>End<b>time</b></td>
-                                  <td><b>Run<b>time</b></td>
-                                  <td><b>Last<b>update time</b></td>
-                                  
-                                  {% for col in hyperparam_columns %}
-                                     <td><b>{{ col }}</b></td>
-                                  {% endfor %}
-                                                                
-                                  {% for col in result_columns %}
-                                     <td><b>{{ col }}</b></td>
-                                  {% endfor %}
-                              </tr>
-                          </thead>
-                          <tbody>
-                              {% for row in rows %}
-                                 <tr>
-                                    <td> <a href="/delete_experiment?experimentid={{ row[0] }}">x</a></td>
-                                    <td> <a href="/reschedule_experiment?experimentid={{ row[0] }}">o</a></td>
-                                 
-                                    <td>{{ row[0] }}</td>
-                                    <td>{{ row[1] }}</td>
-                                    <td><a href="/experiment_yaml_template?experimentid={{ row[0] }}">yaml</a></td>
-                                    <td>{{ row[2] }}</td>
-                                    <td><span title="{{ row[3] }}">here</span></td>
-                                    <td>{{ row[4] }}</td>
-                                    <td>{{ row[5] }}</td>
-                                    <td>{{ row[6] }}</td>
-                                    <td>{{ row[7] }}</td>
-
-                                    {% for col in hyperparam_columns %}
-                                       <td>{{ row[9][col] }}</td>
-                                    {% endfor %}                                
-                                    
-                                    {% for col in result_columns %}
-                                       <td>{{ row[8][col] }}</td>
-                                    {% endfor %}
-                                 </tr>
-                              {% endfor %}
-                            </tbody>
-                        </table>
-                        <br>
-                        To create the view needed by this script:<br>
-                        jobman sqlview postgresql://{{ server['user'] }}:{{ server['password'] }}@{{ server['host'] }}/{{ server['dbname'] }}?table={{ server['tablename'] }} {{ server['view'] }} 
-                        <br>
-                        To schedule a job:<br>
-                        jobman -f sqlschedule postgresql://{{ server['user'] }}:{{ server['password'] }}@{{ server['host'] }}/{{ server['dbname'] }}?table={{ server['tablename'] }} experiment.train_experiment [conf file]<br>
-                        To run a job:<br>
-                        jobman sql postgresql://{{ server['user'] }}:{{ server['password'] }}@{{ server['host'] }}/{{ server['dbname'] }}?table={{ server['tablename'] }} .<br>
-                     </body>
-                   </html>"""
         
-        env = jinja2.Environment( loader=jinja2.DictLoader( {'output':  template} ) )
-        self.wfile.write( env.get_template('output').render(rows=rows, result_columns=result_columns, server=server, hyperparam_columns=hyperparam_columns) )
+        env = jinja2.Environment( loader=jinja2.DictLoader( {'output':  self.template} ) )
+        self.wfile.write( env.get_template('output').render(rows=rows, result_columns=result_columns, db_url=db_url, hyperparam_columns=hyperparam_columns) )
     
     def get_column_names( self ):
         cur = self.get_cursor()
@@ -428,17 +534,13 @@ def start_web_server( wait = True ):
             return
 
 if __name__ == "__main__":
-    if len(sys.argv)<6:
-        print "Need arguments host user password dbname tablename [view]"
-        print "(View is optional, if omitted view is set to [tablename]view"
+    try:
+        _,db_url = sys.argv
+    except:
+        print "Need db url argument (postgres://user:password@host/db_name?table=table_name)"
     else:
-        server['host'] = sys.argv[1]#'localhost'
-        server['user'] = sys.argv[2]#'belius'
-        server['password'] = sys.argv[3]#'9ee2c33138'
-        server['dbname'] = sys.argv[4]#'belius_db'
-        server['tablename'] = sys.argv[5]#'newtest'
-        if len(sys.argv)>=7:
-            server['view'] = sys.argv[6]#'newtestview'
+        if len(sys.argv)<2:
+            print "Need arguments host user password dbname tablename [view]"
+            print "(View is optional, if omitted view is set to [tablename]view"
         else:
-            server['view'] = server['tablename'] + "view"        
-        start_web_server()
+            start_web_server()
