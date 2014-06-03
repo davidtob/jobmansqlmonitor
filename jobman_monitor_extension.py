@@ -31,7 +31,11 @@ class JobmanMonitor(TrainExtension):
         print "jobman on monitor"
         if self.train_obj!=None and self.state!=None:
           print "calling extract_results"
+          t = time.time()
           self.state.results = jobman.tools.resolve(self.state.extract_results)(self.train_obj)
-          if self.channel!=None:
+          print "Took",time.time()-t,"seconds"
+          if self.channel!=None:              
              print "calling channel save"
+             t = time.time()
              self.channel.save()
+             print "Took", time.time()-t,"seconds"
