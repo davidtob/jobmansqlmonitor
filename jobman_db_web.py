@@ -30,9 +30,6 @@ import urllib
 #import json
 import sqlalchemy
 
-server = {} # Filled in from command line
-db_url = "" # Filled in from command line
-
 def jobman_status_string( i ):
     d = {jobman.sql.START: 'QUEUED', jobman.sql.RUNNING: 'RUNNING',
          jobman.sql.DONE: 'DONE',   jobman.sql.ERR_START: 'ERR_START',
@@ -81,13 +78,53 @@ def humanize_time(amount, units):
          amount -= a * INTERVALS[i]
 
    return result
+   
 
-class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):    
-    def do_GET(self):
+def tupleify( l ):
+    if isinstance( l, list ) or isinstance( l, tuple ):
+        return tuple( map( tupleify, l ) )
+    else:
+        return l
+
+# Is caching really necessary? Seems not to give such a big improvement in load speeds
+class Grapher(object):
+    def __init__(self):
+        self.cache = {}
+    
+    def render_graph( self, curves, thumb, from_epoch = 0 ):
+        curves = tupleify(curves)
+        #print "Getting ", curves
+        #print self.cache.keys()   
+        if (curves,thumb) in self.cache.keys():            
+            return self.cache[ (curves,thumb) ]
+        else:
+            plt.figure()
+            #plt.xlabel( xaxis )
+            #plt.ylabel( yaxis )
+            for label,curve in curves:
+                plt.plot( curve, label=label )
+            plt.xlim( [from_epoch, max( map( lambda x: len(x), map( lambda y: y[1], curves) ) )] )
+            plt.legend()
+            buf = io.BytesIO()    
+            if thumb:
+                plt.savefig(buf, format = 'png', dpi=(15))
+            else:
+                plt.savefig(buf, format = 'png' )        
+            buf.seek(0)
+            #print "A", self.cache.keys()
+            self.cache[ (curves,thumb) ] = buf.read()
+            #print "B", self.cache.keys()
+            buf.close()
+            return self.cache[ (curves,thumb) ]
+    
+jobman_monitor_server = None
+
+class JobmanMonitorRequest(SimpleHTTPServer.SimpleHTTPRequestHandler):
+    def do_GET(self):   
         path = urlparse.urlparse(self.path).path
         args = urlparse.parse_qs(urlparse.urlparse(self.path).query)
         if path=='/':
-            commands = filter( lambda x: x[0:3]=="do_" and x!="do_HEAD" and x!="do_GET", dir(self) )
+            commands = filter( lambda x: x[0:3]=="do_" and x!="do_HEAD" and x!="do_GET", dir(jobman_monitor_server) )
             self.send_response(200, 'OK')
             self.send_header('Content-type', 'html')
             self.end_headers()
@@ -95,44 +132,65 @@ class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
             map( lambda x: self.wfile.write(x[3:] + " "), commands )
         else:
             command = "do_" + path[1:]
-            if command in dir(self):
-                func = getattr( self, command )
-                try:
-                    func(args)
+            global jobman_monitor_server
+            if command in dir(jobman_monitor_server):
+                func = getattr( jobman_monitor_server, command )
+                try:                    
+                    func(self.wfile, args)
                 except:
-                    self.send_python_error()
+                    self.send_python_error()                
             else:
                 self.send_error(404, "File not found")
                 return None
 
-    def do_delete_experiment( self, args ):
+    def send_python_error(self):
         self.send_response(200, 'OK')
         self.send_header('Content-type', 'html')
         self.end_headers()
-        if not 'experimentid' in args.keys():
-            self.wfile.write('Need to supply job id, e.g. delete_experiment?experimentid=0')
-            return
-        eid = int(args['experimentid'][0])
+        self.wfile.write( traceback.format_exc() )
+        print traceback.format_exc()
+                
+
+class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
+    def __init__(self, db_url):
+        self.grapher = Grapher()
+        self.db_url = db_url
+        print "Connecting to db"
+        self.db = jobman.api0.open_db(self.db_url, serial=True)
+        print "done"
         
-        cur = self.get_cursor()
-        global server
-        query1 = "delete from %skeyval where dict_id=%d;"%( server['tablename'], eid )
-        query2 = "delete from %strial where id=%d;"%( server['tablename'], eid )
-        cur.execute(query1 )
-        self.conn.commit()
-        self.wfile.write( "Deleted %d rows\n"%cur.rowcount )
-        cur.execute(query2 )
-        self.conn.commit()
-        self.wfile.write( "Deleted %d rows"%cur.rowcount )       
+    def do_delete_experiment( self, wfile, args ):
+        if not 'id' in args.keys():
+            wfile.write( "Need to supply job id, e.g. delete_experiment?id=0'" )
+            return
+        id = map( lambda x: int(x), args['id'] )
+        
+        dcts = self.get_dcts()
+        s = self.get_session()
+        n = 0
+        for dct in dcts:
+            if dct.id in id:
+                dct.delete( s )
+                n = n + 1
+        
+        s.commit()             
+        wfile.write( "Deleted %d jobs"%n )        
+        #cur = self.get_cursor()
+        #global server
+        #query1 = "delete from %skeyval where dict_id=%d;"%( server['tablename'], eid )
+        #query2 = "delete from %strial where id=%d;"%( server['tablename'], eid )
+        #cur.execute(query1 )
+        #self.conn.commit()
+        #wfile.write( "Deleted %d rows\n"%cur.rowcount )
+        #cur.execute(query2 )
+        #self.conn.commit()
+        #wfile.write( "Deleted %d rows"%cur.rowcount )       
     
-    def do_reschedule_experiment( self, args ):
-        self.send_response(200, 'OK')
-        self.send_header('Content-type', 'html')
-        self.end_headers()
-        if not 'experimentid' in args.keys():
+    def do_reschedule_experiment( self, wfile, args ):
+        if not 'id' in args.keys():
             self.wfile.write('Need to supply job id, e.g. reschedule_experiment?experimentid=0')
             return
-        eid = map( lambda x: int(x), args['experimentid'][0].split(",") )
+        id = map( lambda x: int(x), args['id'] )
         if 'force' in args.keys():
             force = args['force'][0]
             if force=='true':
@@ -142,84 +200,41 @@ class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
         else:
             force = False
         
-        cur = self.get_cursor()
-        idcond = "id=" + " or id=".join( map(lambda x: str(x), eid ) )
-        cur.execute( "select status from %strial where %s;"%(server['tablename'],idcond) )
-        rows = cur.fetchall()
-        if len(rows)==0:
-            self.wfile.write("No job with ID %d"%str(eid))
-            return
-        if int(rows[0][0])==jobman.sql.START:
-            self.wfile.write("Job with ID %d is already queued"%eid[0])
-            return
-        if int(rows[0][0])==jobman.sql.RUNNING and (not force):
-            self.wfile.write("Job with ID %d is running. Are you sure you want to restart? If so ?force=true "%eid[0])
-            return
-        
-        query1 = "update %strial set status=%d where %s;"%(server['tablename'],jobman.sql.START,idcond)
-        cur.execute( query1 )
-        self.conn.commit()
-        self.wfile.write( "Updated %d rows\n"%cur.rowcount )
-        idconddict = "dict_id=" + " or dict_id=".join( map(lambda x: str(x), eid ) )
-        query2 = "update %skeyval set ival=%d where %s and name='jobman.status';"%(server['tablename'],jobman.sql.START,idconddict)
-        cur.execute( query2 )
-        self.conn.commit()
-        self.wfile.write( "Updated %d rows"%cur.rowcount )
-
-    def do_experiment_yaml_template( self, args ):
-        self.send_response(200, 'OK')
-        self.send_header('Content-type', 'html')
-        self.end_headers()
-        if not 'experimentid' in args.keys():
-            self.wfile.write('Need to supply job id, e.g. experiment_yaml_template?experimentid=0')
-        eid = int(args['experimentid'][0])
-        
-        cur = self.get_cursor()
-        cur.execute( "select yamltemplate from " + server['view'] + " where id=" + str(eid) + ";")
-        rows = cur.fetchall()
-        if len(rows)==0:
-            self.wfile.write('The view does not have a job with id ' + str(eid))
-            return
-        yaml = rows[0][0]
-        self.wfile.write(yaml)
-            
-    #~ def get_cursor( self ):
-        #~ if not hasattr(self, 'conn' ):
-            #~ try:
-                #~ self.conn = psycopg2.connect("dbname='" + server['dbname'] +
-                                        #~ "' user='" + server['user'] +
-                                        #~ "' host='" + server['host'] + 
-                                        #~ "' password='"+ server['password'] + "'")
-            #~ except:
-                #~ self.send_python_error()
-                #~ raise Exception("Could not connect to database")
-        #~ if not hasattr( self, 'cursor' ):
-            #~ self.cursor = self.conn.cursor()
-        #~ return self.cursor
-    
-    def get_session( self ):
-        global db_url
-        if not hasattr(self, 'db' ):
-            self.db = None
-        if self.db==None:
-            self.db = jobman.api0.open_db(db_url, serial=True)        
-        if not hasattr(self, 'session' ):
-            self.session = None
-        if self.session==None:
-            self.session = self.db.session()
-        return self.session
+        dcts = self.get_dcts()
+        for dct in dcts:
+            thisid = dct.id
+            if dct.id in id:
+                if dct["jobman.status"]==jobman.sql.START:
+                    wfile.write("Job with ID %d is already queued\n"%dct.id)
+                elif dct["jobman.status"]==jobman.sql.RUNNING and (not force):
+                    wfile.write("Job with ID %d is running. Are you sure you want to restart? If so ?force=true\n"%dct.id)
+                else:
+                    #s = self.get_session()
+                    #dct._set_in_session( "jobman.status", jobman.sql.START, session = s )
+                    #s.commit()
+                    dct["jobman.status"] = jobman.sql.START
+                    dct.refresh()
+                    wfile.write("Job with ID %d is rescheduled\n"%thisid)
+                    
+        #~ 
+        #~ query1 = "update %strial set status=%d where %s;"%(server['tablename'],jobman.sql.START,idcond)
+        #~ cur.execute( query1 )
+        #~ self.conn.commit()
+        #~ self.wfile.write( "Updated %d rows\n"%cur.rowcount )
+        #~ idconddict = "dict_id=" + " or dict_id=".join( map(lambda x: str(x), eid ) )
+        #~ query2 = "update %skeyval set ival=%d where %s and name='jobman.status';"%(server['tablename'],jobman.sql.START,idconddict)
+        #~ cur.execute( query2 )
+        #~ self.conn.commit()
+        #~ wfile.write( "Updated %d rows"%cur.rowcount )
     
     def get_dcts( self ):
-        if not hasattr(self, 'dcts' ):
-            s = self.get_session()
-            q = s.query(self.db._Dict)
-            q = q.options(sqlalchemy.orm.eagerload('_attrs')) #hard-coded in api0        
-            self.dcts = q.all()
-        return self.dcts
+        s = self.db.session()
+        q = s.query(self.db._Dict)
+        q = q.options(sqlalchemy.orm.eagerload('_attrs')) #hard-coded in api0        
+        dcts = q.all()
+        s.close()
+        return dcts
     
-    def commit(self):
-        self.session.commit()
-
     experiment_graph_template = """
                         <html>
                         <body>                         
@@ -238,29 +253,33 @@ class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
                         </body>
                         </html>"""
 
+
+    def get_numeric_list_columns( self, dcts ):        
+        ret = {}
+        all_cols = []
+        for dct in dcts:
+            thisid = []
+            for key, val in dct.items():
+                if isinstance(val,list):
+                    if isinstance(val[0], float) or isinstance(val[0], int):
+                        thisid.append( key )
+            all_cols = all_cols + thisid
+            ret[dct.id]= thisid
+        print list(set(all_cols))
+        return ret, list(set(all_cols))
         
-    def do_experiment_graph( self, args ):
+    def do_experiment_graph( self, wfile, args ):
         id = int(args['id'][0])
         keys = args['key']
         dcts = self.get_dcts()
-        checkboxes = []
-        for dct in dcts:
-            if dct.id==id:
-                for key, val in dct.items():
-                    if isinstance(val,list):
-                        if isinstance(val[0], float) or isinstance(val[0], int):
-                            checkboxes.append( key )
-
+        checkboxes = self.get_numeric_list_columns( dcts )[0][id]
         
         env = jinja2.Environment( loader=jinja2.DictLoader( {'output':  self.experiment_graph_template } ) )
-        self.wfile.write( env.get_template('output').render(checkboxes = checkboxes, id=id, keys=keys ) )
-                                    
-        
-    
-    def do_render_graph( self, args ):
-        id = map( lambda x: int(x), args['id'] )        
-        keys = args['key']
-        print args
+        wfile.write( env.get_template('output').render(checkboxes = checkboxes, id=id, keys=keys ) )
+
+    def do_render_graph( self, wfile, args ):
+        id = map( lambda x: int(x), args['id'] )
+        keys = args['key']        
         if 'thumb' in args:
             if args['thumb'][0]=='True':
                 thumb = True
@@ -273,12 +292,7 @@ class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
             from_epoch = int(args['from_epoch'][0])
         else:
             from_epoch = 0
-        #graph_spec = args['graph_spec'][0]
-        #graph_spec=urllib.unquote_plus( graph_spec ) 
         
-        #cur = self.get_cursor()        
-        #cur.execute( "select results_%s from %s where id=%d;"%(colname, server['view'], eid) )
-        #rows = cur.fetchall()
         dcts = self.get_dcts()
         for dct in dcts:
             if dct.id in id:
@@ -290,21 +304,20 @@ class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
                 #    xaxis = 'bla'
                 #    yaxis = 'bla'
                 #    curves = {'bla': graph_spec}
-                curves = {}
+                curves = []
                 for key in keys:
-                    curves["id " + key] = dct[key]
+                    curves.append( ("id " + key,dct[key]) )
         
-        plt.figure()
-        #plt.xlabel( xaxis )
-        #plt.ylabel( yaxis )
-        for label,curve in curves.items():
-            plt.plot( curve, label=label )
-        plt.ylim( [from_epoch, max( map( lambda x: len(x), curves.values() ) )] )
-        plt.legend()
-        if thumb:
-            plt.savefig(self.wfile, format = 'png', dpi=(25))
-        else:
-            plt.savefig(self.wfile, format = 'png' )
+        #~ print hasattr(self, "grapher" )
+        #~ if not hasattr(self, "grapher" ):
+            #~ print "creating new grapher"
+            #~ self.grapher = Grapher()
+            #~ global asdasd
+            #~ asdasd.append( self.grapher )
+            #~ print asdasd
+            #~ print hasattr(self, "grapher" )
+        
+        wfile.write( self.grapher.render_graph( curves, thumb, from_epoch ) )
     
     monitor_template = """
                    <html>
@@ -339,6 +352,7 @@ class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
                               <tr>
                                   <td><b>Ctl</b></td>
                                   <td><b>ID</b></td>
+                                  <td><b>Graph</b></td>
                                   {% for col in cols %}
                                      <td><b>{{ col }}</b></td>
                                   {% endfor %}
@@ -347,8 +361,14 @@ class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
                           <tbody>
                               {% for row in rows %}
                                  <tr>
-                                    <td><span title="x=delete o=reschedule"><a href="/delete_experiment?experimentid={{ row[0] }}">x</a>&nbsp;<a href="/reschedule_experiment?experimentid={{ row[0] }}">o</a></span></td>                                 
-                                    <td>{{ row[0] }}</td>
+                                    <td><span title="x=delete o=reschedule"><a href="/delete_experiment?id={{ row[0] }}">x</a>&nbsp;<a href="/reschedule_experiment?id={{ row[0] }}">o</a></span></td>                                 
+                                    <td>{{ row[0] }}</td>                                    
+                                    <td>
+                                    {% if checked_checkboxesperid[row[0]]|length > 0 %}
+                                        <a href="/experiment_graph?id={{ row[0] }}{% for key in checked_checkboxesperid[row[0]] %}&key={{ key }}{% endfor %}">
+                                            <img width="120" height="90" src="/render_graph?id={{ row[0] }}&thumb=True{% for key in checked_checkboxesperid[row[0]] %}&key={{ key }}{% endfor %}"></td>
+                                        </a>
+                                    {% endif %}
                                     {% for col in cols %}
                                         <td>{{ row[1][col] }}</td>
                                     {% endfor %}
@@ -361,20 +381,26 @@ class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
                         jobman -f sqlschedule {{ db_url }} experiment.train_experiment [conf file]<br>
                         To run a job:<br>
                         jobman sql {{ db_url }} .<br>
+                        <form action="/monitor" method="GET">                            
+                            {% for checkbox in allcheckboxes %}
+                                {% if checkbox in checked_checkboxes %}
+                                    <input type="checkbox" name="key" value="{{ checkbox }}" checked>{{ checkbox }}
+                                {% else %}
+                                    <input type="checkbox" name="key" value="{{ checkbox }}">{{ checkbox }}
+                                {% endif %}
+                            {% endfor %}
+                            <input type="submit"> 
+                        </form>
                      </body>
                     </html>"""
     
-    def do_get_key_contents( self, args ):
-        self.send_response(200, 'OK')
-        self.send_header('Content-type', 'html')
-        self.end_headers()
-        
+    def do_get_key_contents( self, wfile, args ):
         id = int(args['id'][0])
         key = args['key'][0]
         dcts = self.get_dcts()
         for dct in dcts:
             if dct.id==id:
-                self.wfile.write( dct[key] )
+                wfile.write( dct[key] )
     
     def columns( self, dcts ):
         cols = {}
@@ -385,136 +411,66 @@ class JobmanMonitorServer(SimpleHTTPServer.SimpleHTTPRequestHandler):
         ret.sort()
         return ret
 
-    def do_monitor(self, args):
-        global db_url
-        self.send_response(200, 'OK')
-        self.send_header('Content-type', 'html')
-        self.end_headers()    
+    def do_monitor(self, wfile, args):        
+        if 'key' in args.keys():
+            checked_checkboxes = args['key']
+        else:
+            checked_checkboxes = []
         
         dcts = self.get_dcts()
         cols = self.columns( dcts )
         
-        print jobman.tools.expand( dcts[0] )
+        checkboxesperid,allcheckboxes = self.get_numeric_list_columns( dcts )        
+        
+        checked_checkboxesperid = {}
+        for k in checkboxesperid.keys():
+            checked_checkboxesperid[k] = list(set(checkboxesperid[k]).intersection( checked_checkboxes ))
         
         rows = []
         for dct in dcts:
             rowcols = {}
             for col in cols:
                 if col in dct.keys():
-                    #if isinstance(dct[col],list):
-                    s = str(dct[col])
-                    if len(s)>20:
-                        if len(s)>100:
-                            s = "<span title=\"%s\"><a href=\"get_key_contents?id=%d&key=%s\">%s...</a></span>"""%( s, dct.id, col, s[:20] )
-                        else:
-                            s = "<span title=\"%s\">%s...</span>"""%( s, s[:20] )
-                    rowcols[col] = s
+                    if col=="jobman.status":
+                        print dct.id, jobman_status_string( dct["jobman.status"] )
+                        rowcols[col] = jobman_status_string( dct["jobman.status"] )
+                    elif col=="jobman.start_time" or col=="jobman.sql.start_time" or col=="jobman.last_update_time":
+                        rowcols[col] = datetime.datetime.fromtimestamp(float(dct[col])).strftime('%Y-%m-%d %H:%M:%S')
+                    else:
+                        s = str( dct[col] )
+                        if len(s)>20:
+                            if len(s)>100:
+                                s = "<span title=\"%s\"><a href=\"get_key_contents?id=%d&key=%s\">%s...</a></span>"""%( s, dct.id, col, s[:20] )
+                            else:
+                                s = "<span title=\"%s\">%s...</span>"""%( s, s[:20] )
+                        rowcols[col] = s
                 else:
                     rowcols[col] = None                    
             rows.append( (dct.id, rowcols) )
         
         env = jinja2.Environment( loader=jinja2.DictLoader( {'output':  self.monitor_template } ) )
-        self.wfile.write( env.get_template('output').render(cols = cols, rows=rows) )
-        
-        #self.wfile.write( self.columns( dcts ) ) 
-
-        #for d in dcts:
-        #    self.wfile.write("A dict\n")            
-        #    self.wfile.write(str(dir(d)) + "\n")
-        #    self.wfile.write(str(d.id) + "\n")
-        #    for k in d.keys():
-        #        self.wfile.write(k + "\n")
+        wfile.write( env.get_template('output').render(db_url = self.db_url, cols = cols, rows=rows, allcheckboxes=allcheckboxes, checked_checkboxes=checked_checkboxes, checked_checkboxesperid=checked_checkboxesperid ) )            
     
-    def do_monitor_(self, args):
-        global server
-        self.send_response(200, 'OK')
-        self.send_header('Content-type', 'html')
-        self.end_headers()
-        
-        colstoget = ["id", "jobman_status", "jobman_sql_hostname", "jobman_sql_hostworkdir", "jobman_starttime", "jobman_endtime", "jobman_runtime", "jobman_lastsavedtime"]
-        colnames = self.get_column_names()
-        
-        result_columns = filter( lambda x: x.startswith("results_"), colnames )
-        hyperparam_columns = filter( lambda x: x.startswith("hyperparameters_"), colnames )
-        
-        colstoget = colstoget + result_columns + hyperparam_columns
-        result_columns = map( lambda x: x[len("results_"):], result_columns )
-        hyperparam_columns = map( lambda x: x[len("hyperparameters_"):], hyperparam_columns )
-                
-        cur = self.get_cursor()
-        query = "select " + ",".join(filter( lambda x: x in colnames, colstoget )) + " from " + server['view'] + " order by id;"
+        #~ if rows[i][7]!=None: # last update time
+            #~ rows[i][7] = " ".join( map( lambda unit: " ".join( map( lambda x: str(x), unit ) ), humanize_time(int(time.time()-float(rows[i][7])), "seconds") ) ) + " ago"
+            #~ if rows[i][0]!='RUNNING': # Don't display last update time if experiment has ended
+                #~ rows[i][7] = None
 
-        cur.execute( query )
-        rows = cur.fetchall()
-        for i in range(len(rows)):
-            rows[i] = list(rows[i])
-            for j in range(len(colstoget)):
-                if not colstoget[j] in colnames:
-                    rows[i].insert(j, None )
-        for i in range(len(rows)):
-            rows[i][1] = jobman_status_string( rows[i][1] ) # status
-            if rows[i][4]!=None: # start time
-                rows[i][4] = datetime.datetime.fromtimestamp(float(rows[i][4])).strftime('%Y-%m-%d %H:%M:%S')
-            if rows[i][5]!=None: # end time
-                rows[i][5] = datetime.datetime.fromtimestamp(float(rows[i][5])).strftime('%Y-%m-%d %H:%M:%S')
-            if rows[i][6]!=None: # run time
-                rows[i][6] = " ".join( map( lambda unit: " ".join( map( lambda x: str(x), unit ) ), humanize_time(int(rows[i][6]), "seconds") ) )
-            if rows[i][7]!=None: # last update time
-                rows[i][7] = " ".join( map( lambda unit: " ".join( map( lambda x: str(x), unit ) ), humanize_time(int(time.time()-float(rows[i][7])), "seconds") ) ) + " ago"
-                if rows[i][0]!='RUNNING': # Don't display last update time if experiment has ended
-                    rows[i][7] = None
-            therest = rows[i][8:]
-            if len(therest)>0:
-                rows[i][8] = {} # results
-                rows[i][9] = {} # hparams
-                for j,col in enumerate(result_columns):
-                    try:
-                        rows[i][8][col] = json.loads(therest[j])
-                    except:
-                        rows[i][8][col] =  therest[j]
-                    if isinstance( rows[i][8][col], list):
-                        if rows[i][8][col][0]=='graph' or isinstance( rows[i][8][col][0], float ) or isinstance( rows[i][8][col][0], int ):
-                            #imgurl = "/render_graph?graph_spec=%s"%(urllib.quote_plus( results[j] ))
-                            imgurl = "/render_graph?experimentid=%d&colname=%s"%(rows[i][0],col)
-                            scale = "10%"
-                            rows[i][8][col] = "<a href=\"%s\"><img height=\"%s\" src=\"%s\"></a>"%(imgurl,scale,imgurl)
-                        elif rows[i][8][col][0]=='sound':
-                            rows[i][8][col] = 'sound'
-                        elif isinstance( rows[i][8][col][0], list ):
-                            rows[i][8][col] = "list of lists"
-                for j,col in enumerate(hyperparam_columns):
-                    rows[i][9][col] = therest[len(result_columns) + j]
-        
-        env = jinja2.Environment( loader=jinja2.DictLoader( {'output':  self.template} ) )
-        self.wfile.write( env.get_template('output').render(rows=rows, result_columns=result_columns, db_url=db_url, hyperparam_columns=hyperparam_columns) )
-    
-    def get_column_names( self ):
-        cur = self.get_cursor()
-        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='%s'"%server['view'])
-        return map( lambda x: x[0], cur.fetchall() )
-        
 #    def send_ascii_encoded_array( self, arr ):
-#        self.send_response(200, 'OK')
-#        self.send_header('Content-type', 'html')
-#        self.end_headers()
+#        request.send_response(200, 'OK')
+#        request.send_header('Content-type', 'html')
+#        request.end_headers()
 #        ascii = base64.b64encode( cPickle.dumps( arr ) )
 #        self.wfile.write( ascii )
 #
-    def send_python_error(self):
-        self.send_response(200, 'OK')
-        self.send_header('Content-type', 'html')
-        self.end_headers()
-        self.wfile.write( traceback.format_exc() )
-        print traceback.format_exc()
-
 
 def start_web_server( wait = True ):
     def web_server_thread():
-        httpd = None
+        httpd = None        
         for port in range(8000, 8010):
             server_address = ('', port)
             try:
-                httpd = BaseHTTPServer.HTTPServer(server_address, JobmanMonitorServer)
+                httpd = BaseHTTPServer.HTTPServer(server_address, JobmanMonitorRequest)
                 break
             except:
                 print "Could not start on port",port,", trying next"
@@ -539,8 +495,5 @@ if __name__ == "__main__":
     except:
         print "Need db url argument (postgres://user:password@host/db_name?table=table_name)"
     else:
-        if len(sys.argv)<2:
-            print "Need arguments host user password dbname tablename [view]"
-            print "(View is optional, if omitted view is set to [tablename]view"
-        else:
-            start_web_server()
+        jobman_monitor_server = JobmanMonitorServer( db_url )
+        start_web_server()
