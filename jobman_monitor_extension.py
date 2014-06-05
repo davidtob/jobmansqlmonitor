@@ -10,6 +10,7 @@ import theano
 import theano.tensor as T
 from pylearn2.utils import serial
 import jobman
+import time
 
 class JobmanMonitor(TrainExtension):
     def __init__( self ):
